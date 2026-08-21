@@ -107,6 +107,12 @@ pub struct Pane {
     pub split: Option<Direction>,
     pub ratio: Option<f64>,
     pub size: Option<Size>,
+    /// Split off an earlier pane in the same tab (referenced by that pane's
+    /// `title`) instead of the immediately-preceding pane. Stored as that
+    /// pane's index within the tab; `None` keeps the historical default of
+    /// splitting off the previous pane. This is what lets a tab express an
+    /// arbitrary BSP tree, e.g. two columns over a full-width bottom pane.
+    pub from: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -509,6 +515,9 @@ fn normalize_pane(raw: &Value, layout_id: &str, tab_title: &str, index: usize) -
         split: None,
         ratio: None,
         size: None,
+        // Resolved from the raw `from` title to a pane index by normalize_tab,
+        // which has the whole tab's pane list in view.
+        from: None,
     };
     if let Some(split_raw) = opt(raw, "split") {
         pane.split = match js_string(split_raw).to_lowercase().as_str() {
@@ -564,11 +573,48 @@ fn normalize_tab(raw: &Value, layout_id: &str, index: usize) -> Result<Tab, Stri
             ))
         }
     };
-    let panes = panes_raw
+    let mut panes = panes_raw
         .iter()
         .enumerate()
         .map(|(i, p)| normalize_pane(p, layout_id, &tab_label, i))
         .collect::<Result<Vec<_>, _>>()?;
+    // Resolve each pane's `from` (a reference to an earlier pane's title) into
+    // that pane's index. Only earlier panes are eligible: a tab is built in
+    // config order, so a pane can only split off one that already exists.
+    for (i, raw) in panes_raw.iter().enumerate() {
+        let Some(from_raw) = opt(raw, "from") else { continue };
+        let where_ = format!("layout \"{}\", tab \"{}\", pane {}", layout_id, tab_label, i);
+        let target = as_string(Some(from_raw), &format!("{}: from", where_))?;
+        if i == 0 {
+            return Err(format!(
+                "{}: pane 0 is the tab's root pane and cannot set \"from\"",
+                where_
+            ));
+        }
+        let matches: Vec<usize> = panes[..i]
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.title.as_deref() == Some(target.as_str()))
+            .map(|(j, _)| j)
+            .collect();
+        match matches.as_slice() {
+            [] => {
+                return Err(format!(
+                    "{}: \"from\" references \"{}\", but no earlier pane in this tab has that title",
+                    where_, target
+                ))
+            }
+            [j] => panes[i].from = Some(*j),
+            _ => {
+                return Err(format!(
+                    "{}: \"from\" reference \"{}\" is ambiguous ({} earlier panes share that title)",
+                    where_,
+                    target,
+                    matches.len()
+                ))
+            }
+        }
+    }
     Ok(Tab { title, panes })
 }
 
@@ -869,6 +915,97 @@ mod tests {
         // first panes have no split
         assert_eq!(layout.tabs[0].panes[0].split, None);
         assert!(layout.tabs[0].panes[0].setup);
+    }
+
+    #[test]
+    fn from_resolves_to_the_index_of_the_named_earlier_pane() {
+        let config = parse(
+            &[
+                "layouts:",
+                "  - id: x",
+                "    tabs:",
+                "      - title: t",
+                "        panes:",
+                "          - title: left",
+                "          - title: status",
+                "            from: left",
+                "            split: horizontal",
+                "          - title: right",
+                "            from: left",
+                "            split: vertical",
+            ]
+            .join("\n"),
+        );
+        let panes = &find_layout(&config, "x").unwrap().tabs[0].panes;
+        assert_eq!(panes[0].from, None);
+        assert_eq!(panes[1].from, Some(0));
+        assert_eq!(panes[2].from, Some(0));
+    }
+
+    #[test]
+    fn from_defaults_to_none_when_absent() {
+        let config = parse(&sample());
+        for tab in &find_layout(&config, "web-app").unwrap().tabs {
+            for pane in &tab.panes {
+                assert_eq!(pane.from, None);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_from_on_the_root_pane() {
+        let err = parse_err(
+            &[
+                "layouts:",
+                "  - id: x",
+                "    tabs:",
+                "      - title: t",
+                "        panes:",
+                "          - title: a",
+                "            from: a",
+            ]
+            .join("\n"),
+        );
+        assert!(err.contains("pane 0"), "{}", err);
+        assert!(err.contains("from"), "{}", err);
+    }
+
+    #[test]
+    fn rejects_a_from_that_names_no_earlier_pane() {
+        let err = parse_err(
+            &[
+                "layouts:",
+                "  - id: x",
+                "    tabs:",
+                "      - title: t",
+                "        panes:",
+                "          - title: a",
+                "          - title: b",
+                "            from: nope",
+            ]
+            .join("\n"),
+        );
+        assert!(err.contains("no earlier pane"), "{}", err);
+    }
+
+    #[test]
+    fn rejects_an_ambiguous_from_reference() {
+        let err = parse_err(
+            &[
+                "layouts:",
+                "  - id: x",
+                "    tabs:",
+                "      - title: t",
+                "        panes:",
+                "          - title: dup",
+                "          - title: dup",
+                "            split: vertical",
+                "          - title: c",
+                "            from: dup",
+            ]
+            .join("\n"),
+        );
+        assert!(err.contains("ambiguous"), "{}", err);
     }
 
     #[test]

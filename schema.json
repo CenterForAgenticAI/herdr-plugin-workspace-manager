@@ -145,9 +145,13 @@
           "default": false,
           "description": "Marks the single pane that runs the layout's setup.command (at most one per layout)."
         },
+        "from": {
+          "type": "string",
+          "description": "For panes after the first: the title of an EARLIER pane in the same tab to split off, instead of the immediately-preceding pane. Lets a tab describe an arbitrary layout, e.g. split the root down first (a full-width bottom pane), then split the still-full-width top into two columns. The referenced title must be unique among earlier panes."
+        },
         "split": {
           "enum": ["vertical", "horizontal", "right", "down"],
-          "description": "For panes after the first: split direction relative to the previous pane. vertical=side by side (right), horizontal=stacked (down)."
+          "description": "For panes after the first: split direction relative to the parent pane (the `from` pane if set, otherwise the previous pane). vertical=side by side (right), horizontal=stacked (down)."
         },
         "ratio": {
           "type": "number",

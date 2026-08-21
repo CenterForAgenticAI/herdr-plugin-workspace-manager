@@ -229,7 +229,8 @@ lives in [`config.example.yml`](./config.example.yml).
 | `panes[].agentTimeoutMs` | pane | How long to wait for the agent to become ready (herdr allows >3000, ≤300000). |
 | `panes[].promptTimeoutMs` | pane | Setting it makes the apply wait for the agent to settle after `prompt`. Omit to submit and move on. |
 | `panes[].setup` | pane | Marks the single pane that runs `setup.command` (at most one per layout). |
-| `panes[].split` | pane | For panes after the first: `vertical` \| `horizontal` \| `right` \| `down`. |
+| `panes[].split` | pane | For panes after the first: `vertical` \| `horizontal` \| `right` \| `down`. Direction relative to the parent (the `from` pane if set, else the previous pane). |
+| `panes[].from` | pane | For panes after the first: title of an **earlier** pane in the same tab to split off, instead of the previous one. Lets a tab describe an arbitrary layout (e.g. two columns over a full-width bottom). See [Split direction](#split-direction). |
 | `panes[].size` | pane | Optional size of **this** pane along the split axis: fixed cells (`40`), a fraction (`0.3`), or a percentage (`"30%"`). See [Pane sizing](#pane-sizing). |
 | `panes[].ratio` | pane | Legacy split ratio `(0, 1)` — the fraction the **previous** pane keeps. Prefer `size` (mutually exclusive with it). |
 | `workspaces[].repo` | workspace | **Recommended.** Repo root (`~` expanded) or bare repo name. Matches any *linked worktree* of that repo; the main checkout is never touched. |
@@ -258,8 +259,45 @@ but not `hotfix/rwr-1`.
 
 herdr splits are `right` or `down`. This plugin maps `vertical → right` (side
 by side) and `horizontal → down` (stacked); `right`/`down` are also accepted.
-The first pane of a tab is never split; each later pane splits from the
-previous one.
+The first pane of a tab is never split; each later pane splits from its parent —
+by default the pane immediately before it.
+
+#### Splitting off an earlier pane with `from`
+
+By default a tab is a single nested chain, so the only pane that can span the
+full width or height is the first one, and only along one edge. To describe an
+arbitrary layout, give a later pane a `from:` — the **title** of an earlier pane
+in the same tab — and it splits off *that* pane instead of the previous one. The
+referenced title must be unique among the earlier panes.
+
+The classic case is **two columns over a full-width bottom pane**. The trick is
+ordering: split the root **down** first (so the bottom spans the whole width),
+then split the still-full-width top pane **right** into two columns.
+
+```yaml
+panes:
+  - title: left            # pane 0: the tab's root
+  - title: status          # split off 'left' downward -> full-width bottom
+    from: left
+    split: horizontal
+    size: "20%"           # bottom strip takes 20% of the height
+  - title: right           # split off 'left' rightward -> top becomes two columns
+    from: left
+    split: vertical
+    size: "50%"
+```
+
+```
++-------------+-------------+
+|    left     |    right    |   two columns (top ~80%)
++-------------+-------------+
+|          status          |   full-width strip (bottom ~20%)
++-------------------------- +
+```
+
+This builds `split(down, split(right, left, right), status)` — a shape the
+previous-pane-only chain could not express. Omitting every `from` reproduces the
+old right-nested behavior exactly.
 
 ### Pane sizing
 

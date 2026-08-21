@@ -22,6 +22,14 @@
 #   horizontal -> panes stacked top/bottom  (herdr --direction down)
 #   right / down are also accepted literally.
 #
+# pane.from (optional): the title of an EARLIER pane in the same tab to split
+#   off, instead of the immediately-preceding pane (the default). This is what
+#   lets a tab describe an arbitrary layout rather than a single nested chain.
+#   For two columns over a full-width bottom pane, split the root DOWN first (so
+#   the bottom spans the whole width), then split the still-full-width top pane
+#   to the right into two columns -- see the `split-bottom` layout below. The
+#   referenced title must be unique among the earlier panes.
+#
 # pane.size (optional): how big THIS pane is along the split axis -- columns for
 # a vertical split, rows for a horizontal one. Three forms:
 #   40      -> fixed 40 cells (columns/rows)
@@ -118,6 +126,29 @@ layouts:
             command: nvim
           - title: shell
             split: vertical
+
+  # Two columns over a full-width bottom pane, using `from`. The trick is
+  # ordering: split the root DOWN first so the bottom spans the whole width,
+  # then split the still-full-width top pane to the RIGHT into two columns.
+  # Result: split(down, split(right, left, right), status).
+  #   +-------------+-------------+
+  #   |    left     |    right    |   two columns (top ~80%)
+  #   +-------------+-------------+
+  #   |          status          |   full-width strip (bottom ~20%)
+  #   +-------------------------- +
+  - id: split-bottom
+    tabs:
+      - title: main
+        panes:
+          - title: left            # pane 0: the tab's root
+          - title: status          # split off 'left' downward -> full-width bottom
+            from: left
+            split: horizontal
+            size: "20%"           # the bottom strip takes 20% of the height
+          - title: right           # split off 'left' rightward -> top is two columns
+            from: left
+            split: vertical
+            size: "50%"
 
 # ---------------------------------------------------------------------------
 # workspaces: map a repo (or a worktree directory) to a layout.

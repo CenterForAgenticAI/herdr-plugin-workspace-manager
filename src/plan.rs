@@ -217,37 +217,108 @@ fn leaf(ti: usize, pj: usize, pane: &Pane, layout: &Layout, ctx: &PlanContext, s
     })
 }
 
-// Build the right-nested tree for one tab's pane list, tracking the region each
-// split divides so a fixed cell `size` can be resolved without asking herdr.
+// Build one tab's pane list into a BSP tree. Panes are placed in config order:
+// pane 0 is the tab's root, and each later pane splits off a parent -- its
+// `from` pane when set, otherwise the pane immediately before it. Splitting a
+// parent replaces that parent's leaf L with `split(direction, L, new)`, so the
+// new pane is always the split's second child.
+//
+// The default (every pane splitting off the previous one) reproduces the old
+// right-nested tree exactly. A `from` reference is what lets a tab describe an
+// arbitrary tree -- e.g. split the root down first for a full-width bottom pane,
+// then split the still-full-width top into two columns.
+//
+// Each leaf's current region is tracked so a fixed cell `size` resolves to a
+// ratio without asking herdr between splits; a parent's region shrinks as it is
+// split again.
 fn build_tab_tree(
     ti: usize,
     panes: &[Pane],
     layout: &Layout,
     ctx: &PlanContext,
     setup_command: Option<&str>,
-    pj: usize,
-    region: (f64, f64),
+    area: (f64, f64),
 ) -> Node {
-    let pane = &panes[pj];
-    let setup = if pane.setup { setup_command } else { None };
-    let node = leaf(ti, pj, pane, layout, ctx, setup);
-    let Some(next) = panes.get(pj + 1) else { return node };
+    let leaf_for = |pj: usize| {
+        let pane = &panes[pj];
+        let setup = if pane.setup { setup_command } else { None };
+        leaf(ti, pj, pane, layout, ctx, setup)
+    };
 
-    let direction = next.split.unwrap_or(Direction::Right);
-    let ratio = ratio_for(next, region, direction);
-    Node::Split {
-        direction,
-        ratio,
-        first: Box::new(node),
-        second: Box::new(build_tab_tree(
-            ti,
-            panes,
-            layout,
-            ctx,
-            setup_command,
-            pj + 1,
-            remaining(region, direction, ratio),
-        )),
+    let mut root = leaf_for(0);
+    // regions[pj] is the area pane pj's leaf currently occupies.
+    let mut regions = vec![(0.0, 0.0); panes.len()];
+    regions[0] = area;
+
+    for pj in 1..panes.len() {
+        let pane = &panes[pj];
+        let parent = pane.from.unwrap_or(pj - 1);
+        let region = regions[parent];
+        let direction = pane.split.unwrap_or(Direction::Right);
+        // ratio is the first child's (the parent's) share; a pane's `size`
+        // describes itself, the second child, and ratio_for already inverts it.
+        let ratio = ratio_for(pane, region, direction);
+        let new_leaf = leaf_for(pj);
+        let parent_handle = pane_handle(ti, parent);
+        let leftover = split_leaf(&mut root, &parent_handle, direction, ratio, new_leaf);
+        debug_assert!(leftover.is_none(), "parent pane {} not found in tree", parent_handle);
+        regions[parent] = first_share(region, direction, ratio);
+        regions[pj] = remaining(region, direction, ratio);
+    }
+    root
+}
+
+// Replace the leaf whose handle is `handle` with `split(direction, leaf, new)`.
+// Returns `Some(new)` (unused) if the handle wasn't found in this subtree, so
+// the caller can try the sibling, and `None` once it has been inserted. The
+// parent is validated to exist during config normalization, so a miss is a bug.
+fn split_leaf(
+    node: &mut Node,
+    handle: &str,
+    direction: Direction,
+    ratio: f64,
+    new: Node,
+) -> Option<Node> {
+    match node {
+        Node::Pane(spec) if spec.handle == handle => {
+            let parent = std::mem::replace(node, placeholder_node());
+            *node = Node::Split {
+                direction,
+                ratio,
+                first: Box::new(parent),
+                second: Box::new(new),
+            };
+            None
+        }
+        Node::Pane(_) => Some(new),
+        Node::Split { first, second, .. } => {
+            match split_leaf(first, handle, direction, ratio, new) {
+                None => None,
+                Some(new) => split_leaf(second, handle, direction, ratio, new),
+            }
+        }
+    }
+}
+
+// A throwaway node used only as the momentary value of a slot while its real
+// pane is moved into a freshly built split; it is overwritten on the next line.
+fn placeholder_node() -> Node {
+    Node::Pane(PaneSpec {
+        handle: String::new(),
+        title: None,
+        command: None,
+        env: BTreeMap::new(),
+        cwd: None,
+    })
+}
+
+// The share of the region the first child keeps after a split -- the complement
+// of `remaining`, used to track how a parent pane's region shrinks when it is
+// split again.
+fn first_share(region: (f64, f64), direction: Direction, ratio: f64) -> (f64, f64) {
+    match direction {
+        Direction::Right => (region.0 * ratio, region.1),
+        Direction::Down => (region.0, region.1 * ratio),
     }
 }
 
@@ -264,7 +335,7 @@ pub fn build_plan(layout: &Layout, ctx: &PlanContext) -> Plan {
         .map(|(ti, tab)| TabPlan {
             handle: tab_handle(ti),
             title: tab.title.clone(),
-            root: build_tab_tree(ti, &tab.panes, layout, ctx, setup_command, 0, area),
+            root: build_tab_tree(ti, &tab.panes, layout, ctx, setup_command, area),
         })
         .collect();
 
@@ -479,6 +550,93 @@ mod tests {
             .join("\n"),
         );
         let plan = plan_of(&config, "three", &ctx(None));
+        // split(right, a, split(down, b, c))
+        match &plan.tabs[0].root {
+            Node::Split { direction, first, second, .. } => {
+                assert_eq!(*direction, Direction::Right);
+                assert!(matches!(**first, Node::Pane(ref s) if s.handle == "t0p0"));
+                match &**second {
+                    Node::Split { direction, first, second, .. } => {
+                        assert_eq!(*direction, Direction::Down);
+                        assert!(matches!(**first, Node::Pane(ref s) if s.handle == "t0p1"));
+                        assert!(matches!(**second, Node::Pane(ref s) if s.handle == "t0p2"));
+                    }
+                    other => panic!("expected a nested split, got {:?}", other),
+                }
+            }
+            other => panic!("expected a split, got {:?}", other),
+        }
+        assert_eq!(handles_in_tree_order(&plan.tabs[0].root), vec!["t0p0", "t0p1", "t0p2"]);
+    }
+
+    #[test]
+    fn from_builds_two_columns_over_a_full_width_bottom() {
+        let config = parse(
+            &[
+                "layouts:",
+                "  - id: split-bottom",
+                "    tabs:",
+                "      - title: main",
+                "        panes:",
+                "          - title: left",
+                "          - title: status",
+                "            from: left",
+                "            split: horizontal",
+                "            size: \"20%\"",
+                "          - title: right",
+                "            from: left",
+                "            split: vertical",
+                "            size: \"50%\"",
+            ]
+            .join("\n"),
+        );
+        // A shape the previous-pane-only chain can't build:
+        // split(down, split(right, left=t0p0, right=t0p2), status=t0p1)
+        let plan = plan_of(&config, "split-bottom", &ctx(None));
+        match &plan.tabs[0].root {
+            Node::Split { direction, ratio, first, second } => {
+                assert_eq!(*direction, Direction::Down);
+                // status takes 20% of the height -> the top region keeps 0.8.
+                assert!((ratio - 0.8).abs() < 1e-9, "outer ratio {}", ratio);
+                match &**first {
+                    Node::Split { direction, ratio, first, second } => {
+                        assert_eq!(*direction, Direction::Right);
+                        assert!((ratio - 0.5).abs() < 1e-9, "columns ratio {}", ratio);
+                        assert!(matches!(**first, Node::Pane(ref s) if s.handle == "t0p0"));
+                        assert!(matches!(**second, Node::Pane(ref s) if s.handle == "t0p2"));
+                    }
+                    other => panic!("expected the top to be a right split, got {:?}", other),
+                }
+                assert!(matches!(**second, Node::Pane(ref s) if s.handle == "t0p1"));
+            }
+            other => panic!("expected a down split, got {:?}", other),
+        }
+        // herdr echoes panes in tree order; the runner zips against this.
+        assert_eq!(
+            handles_in_tree_order(&plan.tabs[0].root),
+            vec!["t0p0", "t0p2", "t0p1"]
+        );
+    }
+
+    #[test]
+    fn omitting_from_reproduces_the_right_nested_chain() {
+        // Same three panes, no `from`: the historical right-nested tree.
+        let config = parse(
+            &[
+                "layouts:",
+                "  - id: chain",
+                "    tabs:",
+                "      - title: t",
+                "        panes:",
+                "          - title: a",
+                "          - title: b",
+                "            split: vertical",
+                "          - title: c",
+                "            split: horizontal",
+            ]
+            .join("\n"),
+        );
+        let plan = plan_of(&config, "chain", &ctx(None));
         // split(right, a, split(down, b, c))
         match &plan.tabs[0].root {
             Node::Split { direction, first, second, .. } => {
